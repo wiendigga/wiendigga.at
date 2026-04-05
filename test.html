@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>wiendigga</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: #ffffff;
+    }
+
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .wind-wrap {
+      position: relative;
+      display: inline-block;
+    }
+
+    img {
+      display: block;
+      max-height: 80vh;
+      max-width: 100%;
+      height: auto;
+      width: auto;
+      cursor: help;
+    }
+
+    .wind-tooltip {
+      position: absolute;
+      left: 50%;
+      bottom: 1rem;
+      transform: translateX(-50%);
+      background: rgba(255, 255, 255, 0.96);
+      color: #000;
+      border: 1px solid #000;
+      padding: 0.55rem 0.75rem;
+      font: 14px/1.35 Arial, sans-serif;
+      white-space: nowrap;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 120ms ease;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+    }
+
+    .wind-wrap:hover .wind-tooltip,
+    .wind-wrap:focus-within .wind-tooltip,
+    .wind-wrap.show-tooltip .wind-tooltip {
+      opacity: 1;
+    }
+  </style>
+</head>
+<body>
+  <div class="wind-wrap" id="windWrap">
+    <img
+      id="mainImage"
+      src="wiendigga2.png"
+      alt="Minimalist black-and-white AI-generated illustration of an empress in windy Vienna"
+      tabindex="0"
+    />
+    <div class="wind-tooltip" id="windTooltip">
+      Hovering...
+    </div>
+  </div>
+
+  <script>
+    const windWrap = document.getElementById("windWrap");
+    const windTooltip = document.getElementById("windTooltip");
+    const mainImage = document.getElementById("mainImage");
+
+    // Official GeoSphere Austria endpoint:
+    // current TAWES 10-minute data, station 11034 = Wien Innere Stadt
+    const WIND_URL =
+      "https://dataset.api.hub.geosphere.at/v1/station/current/tawes-v1-10min" +
+      "?station_ids=11034&parameters=FFAM";
+
+    let windCache = null;
+    let lastFetchTs = 0;
+    const CACHE_MS = 5 * 60 * 1000; // 5 minutes
+
+    function setTooltip(text) {
+      windTooltip.textContent = text;
+    }
+
+    function pickWindValue(data) {
+      // Be tolerant to different response shapes.
+      // We try several plausible locations for the value.
+      const candidates = [];
+
+      // Generic recursive collector for numeric leaves under FFAM/ffam.
+      function walk(obj, path = []) {
+        if (!obj || typeof obj !== "object") return;
+
+        for (const [key, value] of Object.entries(obj)) {
+          const nextPath = path.concat(key);
+
+          if (
+            (key === "FFAM" || key === "ffam") &&
+            (typeof value === "number" || typeof value === "string")
+          ) {
+            candidates.push({ path: nextPath.join("."), value });
+          }
+
+          if (Array.isArray(value)) {
+            // Sometimes values come as arrays, e.g. data[0]
+            if ((key === "FFAM" || key === "ffam") && value.length > 0) {
+              const firstNumeric = value.find(v => !isNaN(Number(v)));
+              if (firstNumeric !== undefined) {
+                candidates.push({ path: nextPath.join("."), value: firstNumeric });
+              }
+            }
+            value.forEach((item, i) => walk(item, nextPath.concat(String(i))));
+          } else if (value && typeof value === "object") {
+            walk(value, nextPath);
+          }
+        }
+      }
+
+      walk(data);
+
+      for (const c of candidates) {
+        const num = Number(c.value);
+        if (!Number.isNaN(num)) return num;
+      }
+
+      return null;
+    }
+
+    function pickTimestamp(data) {
+      const possibleKeys = [
+        "timestamp",
+        "timestamps",
+        "time",
+        "times",
+        "valid_time",
+        "reference_time"
+      ];
+
+      function walk(obj) {
+        if (!obj || typeof obj !== "object") return null;
+
+        for (const [key, value] of Object.entries(obj)) {
+          if (possibleKeys.includes(key)) {
+            if (typeof value === "string") return value;
+            if (Array.isArray(value) && value.length > 0) return value[0];
+          }
+          if (value && typeof value === "object") {
+            const nested = walk(value);
+            if (nested) return nested;
+          }
+        }
+        return null;
+      }
+
+      return walk(data);
+    }
+
+    function pickUnit(data) {
+      // Default to m/s if unit cannot be found.
+      // TAWES wind speed is typically exposed with a unit in the API metadata/response,
+      // but we keep the UI robust.
+      const possibleKeys = ["unit", "units", "parameter_unit"];
+
+      function walk(obj) {
+        if (!obj || typeof obj !== "object") return null;
+
+        for (const [key, value] of Object.entries(obj)) {
+          if (
+            possibleKeys.includes(key) &&
+            (typeof value === "string")
+          ) {
+            return value;
+          }
+          if (value && typeof value === "object") {
+            const nested = walk(value);
+            if (nested) return nested;
+          }
+        }
+        return null;
+      }
+
+      const found = walk(data);
+      return found || "m/s";
+    }
+
+    async function loadWind() {
+      const now = Date.now();
+
+      if (windCache && now - lastFetchTs < CACHE_MS) {
+        return windCache;
+      }
+
+      const res = await fetch(WIND_URL, { cache: "no-store" });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      const value = pickWindValue(data);
+      const timestamp = pickTimestamp(data);
+      const unit = pickUnit(data);
+
+      if (value === null) {
+        throw new Error("No wind value found in response");
+      }
+
+      windCache = { value, timestamp, unit };
+      lastFetchTs = now;
+      return windCache;
+    }
+
+    async function showWind() {
+      windWrap.classList.add("show-tooltip");
+      setTooltip("Loading wind…");
+
+      try {
+        const { value, timestamp, unit } = await loadWind();
+        const rounded = Number(value).toFixed(1);
+        const when = timestamp ? ` (${timestamp})` : "";
+        setTooltip(`Wien Innere Stadt: ${rounded} ${unit}${when}`);
+      } catch (err) {
+        setTooltip("Wind currently unavailable");
+        console.error(err);
+      }
+    }
+
+    function hideWind() {
+      windWrap.classList.remove("show-tooltip");
+    }
+
+    mainImage.addEventListener("mouseenter", showWind);
+    mainImage.addEventListener("focus", showWind);
+    mainImage.addEventListener("mouseleave", hideWind);
+    mainImage.addEventListener("blur", hideWind);
+
+    // Mobile fallback: tap to show/update
+    mainImage.addEventListener("click", showWind);
+  </script>
+</body>
+</html>
